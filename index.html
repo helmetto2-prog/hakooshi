@@ -12,6 +12,13 @@
   canvas { display:block; box-shadow:0 0 36px rgba(120,150,255,0.3); border-radius:8px;
            max-width:98vw; height:auto; }
   #hint { color:#8aa; font-size:12px; margin-top:8px; }
+  /* v16: オンラインランキング */
+  #rankbar { margin-top:10px; display:flex; gap:10px; justify-content:center; flex-wrap:wrap; }
+  #rankbar button, #rankbar a { border:1px solid #4a5a9a; background:#1c2450; color:#dfe6ff; border-radius:12px;
+      padding:8px 16px; font-size:13px; font-family:inherit; cursor:pointer; text-decoration:none;
+      touch-action:manipulation; }
+  #rankbar button:active, #rankbar a:active { background:#3a4a8a; transform:scale(.96); }
+  #rankbar button:disabled { opacity:.7; }
   /* ==== スマホ用タッチパッド（タッチ端末のみ表示） ==== */
   #pad { display:none; margin-top:10px; gap:8px; align-items:center;
          padding-bottom:calc(8px + env(safe-area-inset-bottom)); }
@@ -36,6 +43,10 @@
 </head>
 <body>
 <canvas id="c" width="480" height="520"></canvas>
+<div id="rankbar">
+  <button id="btnRank">🏆 ランキングに登録</button>
+  <a href="https://helmetto2-prog.github.io/ranking-hiroba/" target="_blank" rel="noopener">🌍 広場を見る</a>
+</div>
 <div id="hint">← ↑ → ↓ 押す ／ Z・U もどす ／ R やり直し ／ クリアで Space 次へ ／ M 音 ／ P ポーズ（スマホ＝スワイプでも移動）</div>
 <div id="pad">
   <div class="dpad">
@@ -570,6 +581,43 @@ function onKey(code){
   document.getElementById('padNext').addEventListener('pointerdown', e=>{ e.preventDefault(); SFX.ensure();
     onKey('Space'); });
 })();
+
+/* ==== v16: オンラインランキング（ゲームランキング台帳GAS API・ランキング広場と共通） ==== */
+const RANK_API='https://script.google.com/macros/s/AKfycbz3yJMoui8-HX0iec4dLgW-Wk2nwBxa8t86CmGiuU9-PqqjG8PVb6emUodSweBZfID0Mw/exec';
+const RANK_GAME='はこおし';
+function rankName(){
+  let n=''; try{ n=localStorage.getItem('zunda_rank_name')||''; }catch(e){}
+  if(!n){
+    n=(prompt('ランキングに のせる名前（12文字まで）','')||'').slice(0,12).trim();
+    if(n){ try{ localStorage.setItem('zunda_rank_name',n); }catch(e){} }
+  }
+  return n;
+}
+// スコア＝クリア面数×1000 −（各面のベスト手数の合計）。面を進めるほど高く、同じ面数なら手数が少ないほど高い
+function rankScore(){
+  let cleared=0, moves=0;
+  for(let i=0;i<LEVELS.length;i++){ const b=Best.get(i); if(b>0){ cleared++; moves+=b; } }
+  return { score: Math.max(0, cleared*1000 - moves), cleared, moves };
+}
+async function submitRank(btn){
+  const s=rankScore();
+  if(s.cleared===0){ btn.textContent='まず1面クリアしてね'; setTimeout(()=>{btn.textContent='🏆 ランキングに登録';},1800); return; }
+  const n=rankName(); if(!n) return;
+  btn.disabled=true; btn.textContent='送信中…';
+  try{
+    const fd=new URLSearchParams();
+    fd.append('action','submit'); fd.append('game',RANK_GAME);
+    fd.append('name',n); fd.append('score',String(s.score));
+    fd.append('extra', s.cleared+'/'+LEVELS.length+'面・総手数'+s.moves);
+    const res=await fetch(RANK_API,{method:'POST',body:fd});
+    const d=await res.json();
+    if(!d.ok) throw 0;
+    btn.textContent='✅ 登録完了！ 現在 '+d.rank+'位';
+  }catch(e){
+    btn.disabled=false; btn.textContent='送信失敗…もう一度';
+  }
+}
+document.getElementById('btnRank').addEventListener('click', e=>submitRank(e.currentTarget));
 
 state='title';
 requestAnimationFrame(loop);
