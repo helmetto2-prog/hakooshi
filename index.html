@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>はこおし</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { touch-action:none; overscroll-behavior:none; }
+  body { background:#0c1024; display:flex; flex-direction:column; align-items:center; justify-content:center;
+         min-height:100vh; font-family:'Segoe UI','MS PGothic',sans-serif; user-select:none; }
+  canvas { display:block; box-shadow:0 0 36px rgba(120,150,255,0.3); border-radius:8px;
+           max-width:98vw; height:auto; }
+  #hint { color:#8aa; font-size:12px; margin-top:8px; }
+  /* ==== スマホ用タッチパッド（タッチ端末のみ表示） ==== */
+  #pad { display:none; margin-top:10px; gap:8px; align-items:center;
+         padding-bottom:calc(8px + env(safe-area-inset-bottom)); }
+  #pad .dpad { display:grid; grid-template-columns:repeat(3,54px); grid-template-rows:repeat(3,54px); gap:4px; }
+  #pad button { border:1px solid #3a4a7a; background:#1c2450; color:#dfe6ff; border-radius:12px;
+                font-size:20px; font-weight:700; cursor:pointer; touch-action:manipulation; }
+  #pad button:active { background:#3a4a8a; transform:scale(.93); }
+  #pad .side { display:flex; flex-direction:column; gap:8px; }
+  #pad .side button { width:74px; height:48px; font-size:14px; }
+  @media (pointer:coarse) {
+    #pad { display:flex; }
+    #hint { display:none; }
+    body { justify-content:flex-start; padding-top:8px; }
+    canvas { max-height:62vh; width:auto; max-width:98vw; }
+  }
+  /* v15: pointer:coarse を名乗らないタッチ端末（スタイラス併用Android等）でもパッドを出す保険 */
+  html.touch #pad { display:flex; }
+  html.touch #hint { display:none; }
+  html.touch body { justify-content:flex-start; padding-top:8px; }
+  html.touch canvas { max-height:62vh; width:auto; max-width:98vw; }
+</style>
+</head>
+<body>
+<canvas id="c" width="480" height="520"></canvas>
+<div id="hint">← ↑ → ↓ 押す ／ Z・U もどす ／ R やり直し ／ クリアで Space 次へ ／ M 音 ／ P ポーズ（スマホ＝スワイプでも移動）</div>
+<div id="pad">
+  <div class="dpad">
+    <span></span><button data-mv="0,-1">▲</button><span></span>
+    <button data-mv="-1,0">◀</button><span></span><button data-mv="1,0">▶</button>
+    <span></span><button data-mv="0,1">▼</button><span></span>
+  </div>
+  <div class="side">
+    <button id="padUndo">↩ もどす</button>
+    <button id="padReset">🔄 やり直し</button>
+    <button id="padNext">▶ 決定/次へ</button>
+  </div>
+</div>
+<script>
+/* v15: タッチ端末の判定を pointer:coarse だけに頼らない（端末によっては coarse を名乗らないため） */
+if (('ontouchstart' in window) || navigator.maxTouchPoints > 0 ||
+    (window.matchMedia && matchMedia('(pointer:coarse)').matches)) {
+  document.documentElement.classList.add('touch');
+}
+</script>
+<div id="errbar" style="display:none;position:fixed;left:0;right:0;bottom:0;background:#c62828;color:#fff;font:12px Consolas,monospace;padding:6px 10px;z-index:99;white-space:pre-wrap"></div>
+<script>
+function showErr(m){ try{ var e=document.getElementById('errbar'); e.style.display='block';
+  if (e.textContent.indexOf(m)<0) e.textContent+=m+'\n'; }catch(_){} }
+window.onerror=function(msg,src,line,col){ showErr(msg+' @'+line+':'+col); };
+window.addEventListener('unhandledrejection',function(ev){ showErr('Promise: '+(ev.reason&&ev.reason.message||ev.reason)); });
+</script>
+<script>
+'use strict';
+/* ===== ENGINE (reusable: loop, state, Input, SFX, FX, helpers) ===== */
+const C = document.getElementById('c'), ctx = C.getContext('2d');
+let W = C.width, H = C.height;   // v08: 広間ステージ（21面〜）でキャンバスを拡大するため可変に
+const clock = () => performance.now();
+const clamp = (v,a,b) => v<a?a:v>b?b:v;
+let state = 'title';
+let G = null;
+
+const Input = (function(){
+  const keys=new Set(), edge=new Set();
+  const BLOCK=['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Space'];
+  document.addEventListener('keydown', e => { SFX.ensure(); if(BLOCK.includes(e.code)) e.preventDefault();
+    if(!keys.has(e.code)) edge.add(e.code); keys.add(e.code); onKey(e.code); });
+  document.addEventListener('keyup', e => keys.delete(e.code));
+  C.addEventListener('click', () => { SFX.ensure(); if(state==='title'||state==='over'||state==='intro') onKey('Space'); });
+  return { held:c=>keys.has(c), pressed:c=>edge.has(c), clearEdges:()=>edge.clear() };
+})();
+
+const SFX = (function(){
+  let ac=null,master=null,on=true;
+  const midi=n=>440*Math.pow(2,(n-69)/12);
+  function tone(f,d,t,v){ if(!ac)return; const s=ac.currentTime+0.01,o=ac.createOscillator(),g=ac.createGain();
+    o.type=t;o.frequency.value=f;g.gain.setValueAtTime(0,s);g.gain.linearRampToValueAtTime(v,s+0.01);
+    g.gain.exponentialRampToValueAtTime(0.0006,s+d);o.connect(g).connect(master);o.start(s);o.stop(s+d+0.03); }
+  function noise(v,fr,d){ if(!ac)return; const s=ac.currentTime+0.01,b=ac.createBuffer(1,1024,ac.sampleRate),dt=b.getChannelData(0);
+    for(let i=0;i<dt.length;i++)dt[i]=Math.random()*2-1; const src=ac.createBufferSource();src.buffer=b;
+    const f=ac.createBiquadFilter();f.type='bandpass';f.frequency.value=fr;const g=ac.createGain();
+    g.gain.setValueAtTime(v,s);g.gain.exponentialRampToValueAtTime(0.001,s+d);src.connect(f).connect(g).connect(master);src.start(s);src.stop(s+d+0.05); }
+  let bgmIv=null, step=0, tier=0, footL=false;
+  // 石坂真希(M2 場面別切替): 面のタイプでBGMの調子を切り替える
+  //  0=練習(1-6) おだやかで明るい / 1=高難度(7-16) 短調寄り・テンポ速め・緊張感 / 2=広間・EX(17-30) 開放的で低音厚め
+  const BGM=[
+    { ms:60000/150/4,
+      bass:[36,36,43,36, 41,41,43,41, 43,43,45,43, 41,41,36,36],
+      lead:[72,76,79,76, 77,81,79,76, 74,79,83,79, 72,76,74,72] },
+    { ms:60000/170/4,
+      bass:[33,33,40,33, 34,34,41,34, 36,36,43,36, 34,34,33,33],
+      lead:[69,72,76,72, 70,74,77,74, 72,75,79,75, 68,72,70,69] },
+    { ms:60000/162/4,
+      bass:[38,38,45,38, 43,43,50,43, 41,41,48,41, 43,43,45,45],
+      lead:[74,78,81,78, 79,83,86,83, 77,81,84,81, 79,83,81,78] },
+  ];
+  function bgmTick(){ if(!ac) return; const S=BGM[tier];
+    tone(midi(S.bass[step]),0.16,'triangle',0.15);
+    tone(midi(S.lead[step]),0.11,'square',0.06);
+    if(step%4===0) tone(midi(S.bass[step]-12),0.13,'sine',0.20);   // キック（各tierの低音に追従）
+    if(step%2===1) noise(0.045, tier===1?9000:7000, 0.03);
+    step=(step+1)%16; }
+  return {
+    get on(){return on;},
+    ensure(){ try{ if(!ac){ const A=window.AudioContext||window.webkitAudioContext; if(!A)return;
+      ac=new A();master=ac.createGain();master.gain.value=on?0.2:0;master.connect(ac.destination);} if(ac.state==='suspended')ac.resume(); }catch(e){} },
+    toggle(){ on=!on; if(master)master.gain.value=on?0.2:0; },
+    startBGM(){ this.ensure(); if(ac && !bgmIv){ step=0; bgmIv=setInterval(bgmTick,BGM[tier].ms); } },
+    stopBGM(){ if(bgmIv){ clearInterval(bgmIv); bgmIv=null; } },
+    setTier(t){ if(t===tier) return; tier=t; if(bgmIv){ clearInterval(bgmIv); step=0; bgmIv=setInterval(bgmTick,BGM[tier].ms); } },
+    // ===== 石坂真希(M4 効果音): 全アクションに専用の音。倉庫＝木と鉄と足音の世界で統一 =====
+    // 素の移動＝足音（左右交互に高さを変えて「歩いている」実感を出す）
+    move(){ footL=!footL; tone(footL?188:164,0.045,'triangle',0.055); noise(0.05,footL?1500:1200,0.035); },
+    // 箱を押す＝床をこする重い音（移動と明確に区別。これが無いと「押した手応え」が無い）
+    push(){ noise(0.075,520,0.16); tone(96,0.15,'sawtooth',0.045); tone(143,0.09,'triangle',0.035);
+      footL=!footL; noise(0.035,footL?1500:1200,0.03); },
+    undo(){ tone(523,0.07,'triangle',0.06); setTimeout(()=>tone(392,0.09,'triangle',0.05),55); },
+    // 目標に納める＝残り箱数が減るほど高く鳴る「達成の階段」。最後の1個は追い和音つき
+    place(remain){ const up=Math.max(0,6-(remain|0))*2;   // 残りが少ないほど高音へ
+      tone(midi(72+up),0.10,'square',0.085); tone(midi(76+up),0.09,'triangle',0.055); tone(midi(79+up),0.08,'sine',0.04);
+      if(remain===0){ setTimeout(()=>{ [84,88].forEach(m=>tone(midi(m),0.16,'sine',0.05)); },70); } },
+    blocked(){ tone(104,0.07,'sawtooth',0.055); noise(0.05,260,0.06); },      // 壁・箱にぶつかる鈍い衝突
+    warn(){ tone(midi(63),0.13,'square',0.06); setTimeout(()=>tone(midi(59),0.20,'square',0.06),110);
+      setTimeout(()=>noise(0.03,2400,0.08),110); },                            // 詰み（角に入れた）警告ブザー
+    reset(){ noise(0.055,900,0.20); [76,71,67,60].forEach((m,i)=>setTimeout(()=>tone(midi(m),0.10,'triangle',0.055), i*45)); },
+    select(){ tone(midi(72),0.08,'square',0.09); setTimeout(()=>tone(midi(79),0.14,'square',0.08),70); },
+    pause(){ tone(midi(70),0.10,'sine',0.08); setTimeout(()=>tone(midi(65),0.16,'sine',0.06),80); },
+    resume(){ tone(midi(65),0.09,'sine',0.07); setTimeout(()=>tone(midi(72),0.14,'sine',0.08),70); },
+    // 石坂真希(M3 ジングル): 節目ごとに専用の短尺曲。二声（オクターブ下ハモり）＋和音でリッチに。
+    clear(){   // 面クリア: 明るい上昇アルペジオ→最終和音
+      const seq=[60,64,67,72];
+      seq.forEach((m,i)=>setTimeout(()=>{ tone(midi(m),0.22,'square',0.11); tone(midi(m-12),0.22,'triangle',0.05); }, i*110));
+      setTimeout(()=>{ [64,67,72,76].forEach(m=>tone(midi(m),0.5,'triangle',0.09)); }, seq.length*110); },
+    perfect(){ // 理論最短達成のきらめき（clear/allClearに重ねて鳴らす）
+      [84,88,91,96].forEach((m,i)=>setTimeout(()=>{ tone(midi(m),0.14,'sine',0.06); noise(0.03,9000,0.04); }, 240+i*70)); },
+    allClear(){ // 全面クリア: 二声ファンファーレ＋長い和音＋きらめき
+      const fan=[60,67,72,76,79,84];
+      fan.forEach((m,i)=>setTimeout(()=>{ tone(midi(m),0.26,'square',0.12); tone(midi(m-12),0.26,'triangle',0.06); }, i*130));
+      setTimeout(()=>{ [72,76,79,84].forEach(m=>tone(midi(m),0.9,'triangle',0.10)); noise(0.05,8000,0.3); }, fan.length*130); },
+  };
+})();
+
+// 井上瑞季(D2 演出パッケージ v13): 既存の粒子/ゆれ/閃光に加え、
+//   ①広がる衝撃波リング ②押し/衝突の砂ぼこり ③色つき閃光 を追加し、
+//   「押す・納める・ぶつかる・クリア」の全アクションが画面で気持ちよく反応するようにする。
+const FX = (function(){
+  let parts=[],rings=[],shake=0,flash=0,flashC='#fff';
+  return {
+    burst(x,y,col,n){ n=n||8; for(let i=0;i<n;i++){ const a=Math.random()*6.2832,s=1.5+Math.random()*3.5;
+      parts.push({x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s-1.5,col:col||'#fff',life:0,dur:0.4+Math.random()*0.3}); } },
+    // 砂ぼこり: ゆっくり広がり、重力が弱く「ふわっ」と舞う低い粒（押し/衝突の土煙）
+    puff(x,y,col,n,spd){ n=n||6; spd=spd||1.2; for(let i=0;i<n;i++){ const a=Math.random()*6.2832,s=spd*(0.4+Math.random());
+      parts.push({x:x+(Math.random()-0.5)*8,y:y+(Math.random()-0.5)*4,vx:Math.cos(a)*s,vy:-Math.abs(Math.sin(a)*s)*0.5-0.25,
+        col:col||'#c9a06a',life:0,dur:0.35+Math.random()*0.28,r:2+Math.random()*1.6,g:0.10}); } },
+    // 衝撃波リング: 素早く広がって減速する輪（納める/クリアの節目に）
+    ring(x,y,col,maxR,dur,width){ rings.push({x,y,col:col||'#fff',maxR:maxR||60,life:0,dur:dur||0.5,w:width||4}); },
+    shake(a){ shake=Math.max(shake,a); },
+    flash(a,c){ flash=Math.max(flash,a); if(c)flashC=c; },
+    update(dt){ const f=dt/16;
+      for(const p of parts){ p.life+=dt/1000;p.x+=p.vx*f;p.y+=p.vy*f;p.vy+=(p.g||0.4)*f; }
+      parts=parts.filter(p=>p.life<p.dur);
+      for(const r of rings){ r.life+=dt/1000; }
+      rings=rings.filter(r=>r.life<r.dur);
+      shake=Math.max(0,shake-dt/16); flash=Math.max(0,flash-dt/260); if(flash<=0)flashC='#fff'; },
+    preDraw(){ if(shake>0){ ctx.save(); ctx.translate((Math.random()-0.5)*shake,(Math.random()-0.5)*shake);} },
+    postDraw(){ if(shake>0)ctx.restore();
+      for(const r of rings){ const t=r.life/r.dur, e=1-(1-t)*(1-t), rad=Math.max(1,r.maxR*e);   // ease-out で広がる
+        ctx.save(); ctx.globalAlpha=Math.max(0,1-t); ctx.strokeStyle=r.col; ctx.lineWidth=Math.max(0.5,r.w*(1-t));
+        ctx.beginPath(); ctx.arc(r.x,r.y,rad,0,6.2832); ctx.stroke(); ctx.restore(); }
+      for(const p of parts){ ctx.save();ctx.globalAlpha=Math.max(0,1-p.life/p.dur);
+      ctx.fillStyle=p.col;ctx.beginPath();ctx.arc(p.x,p.y,p.r||3,0,6.2832);ctx.fill();ctx.restore(); }
+      if(flash>0){ ctx.save(); ctx.globalAlpha=Math.min(0.55,flash); ctx.fillStyle=flashC; ctx.fillRect(0,0,W,H); ctx.restore(); } },
+  };
+})();
+
+// file:// では localStorage が例外を投げる環境があるためガード必須
+const Best = { mem:{},
+  // v14: 面の並びが変わったため記録キーを世代分け（旧記録の誤表示を防ぐ）
+  get(i){ try{ return +(localStorage.getItem('sokoban_best_v14_'+i)||0); }catch(e){ return this.mem[i]||0; } },
+  set(i,v){ this.mem[i]=v; try{ localStorage.setItem('sokoban_best_v14_'+i, v); }catch(e){} } };
+// 榊原千唐：物語・導線まわりの永続記録＋状態
+let seenIntro = (function(){ try{ return localStorage.getItem('hakoloshi_intro')==='1'; }catch(e){ return false; } })();
+let shownFlavorLv = new Set();      // このプレイで既に見せた節目セリフ（同一面の再挑戦で連呼しない）
+let flavorText = null, flavorBorn = 0;
+
+function clearBG(){ const g=ctx.createLinearGradient(0,0,0,H); g.addColorStop(0,'#141a3a'); g.addColorStop(1,'#0c1024'); ctx.fillStyle=g; ctx.fillRect(0,0,W,H); }
+function rrect(x,y,w,h,r){ ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
+function overlay(title,col,sub){ ctx.fillStyle='rgba(0,0,0,0.68)'; ctx.fillRect(0,0,W,H); ctx.textAlign='center';
+  ctx.fillStyle=col; ctx.font='bold 40px "Segoe UI"'; ctx.fillText(title,W/2,H/2-14);
+  ctx.fillStyle='#aaa'; ctx.font='15px "Segoe UI"';
+  String(sub).split('\n').forEach((ln,i)=>ctx.fillText(ln,W/2,H/2+40+i*20)); }
+
+let lastT=0;
+function loop(t){ const dt=lastT?Math.min(50,t-lastT):16; lastT=t;
+  try {
+    if(state==='play')update(dt); FX.update(dt); render(); Input.clearEdges();
+  } catch(err){ showErr(err.message+' ['+((err.stack||'').split('\n')[1]||'').trim()+']'); }
+  requestAnimationFrame(loop); }
+
+/* ===== GAME : 倉庫番 (Sokoban) v05 ===== */
+// 通称「くらくら倉庫」――棚の配置が日によって変わるという噂の職場（榊原千唐・世界観設定）
+// レベル: # 壁 / . 目標 / $ 箱 / * 箱(目標上) / @ プレイヤー / + プレイヤー(目標上) / 空白 床
+// 全30面。1-6=練習、7-16=高難度、17-26=広間、27-30=EX裏倉庫（面ごとに「難所タイプ」ラベル付き）。
+// ★全面、押しBFSソルバー（デッド地帯＋2x2凍結の枝刈り付き）で解けることを機械検証済み。
+//   par = ソルバーが求めた理論最短の「押し数」。旧v03の面10こ箱6/目標5で解けない不良だったため修正。
+// v14: 旧4・6・8・9面（じゅうじ/３れんおし/ふりわけ/たいかく）を削除し、EX裏倉庫4面(27-30)を新設。
+//   EXは倉庫番研究の「難しさの源泉」を題材に設計:
+//   ゴール詰め込み順(packing order)・一時置き(parking)・ゴール上の箱の再移動・凍結/角デッドロック。
+const LEVELS = [
+  { name:'ならい',       par:3,  map:["#######","#  .  #","# #$# #","# $ . #","#  @  #","#######"] },
+  { name:'ふたまた',     par:4,  map:["#######","#.   .#","# $#$ #","#  @  #","#######"] },
+  { name:'みつご',       par:6,  map:["#######","#  .  #","# .#. #","# $$$ #","#  @  #","#######"] },
+  { name:'よせあつめ',   par:8,  map:["#######","#.   .#","#  $  #","# $@$ #","#  .  #","#######"] },
+  { name:'ここびわけ',   par:10, map:["#######","#. $  #","# $#$ #","#  $ .#","#. @ .#","#######"] },
+  { name:'みつどじゅうじ', par:11, map:["#######","#  @  #","# $.$ #","#.$#$.#","# $.$ #","#  .. #","#######"] },
+  // ---- ここから高難度（難所タイプ付き）----
+  { name:'順番強制',     par:10, hard:true, map:["#########","#   #   #","# $ # . #","# $ @ . #","#   #   #","#########"],
+    flavor:['「練習はここまで――ここからは、正真正銘の"難所"だよ」（棚橋さんの声）','（棚橋）「順番を間違えると、詰む。落ち着いて、押す順を考えて」'] },
+  { name:'回り込み',     par:10, hard:true, map:["#########","#.  $  .#","# ### # #","# #     #","# # ###$#","#.$ $  +#","#########"] },
+  { name:'埋め順',       par:14, hard:true, map:["########","#  #  .#","#  #  .#","#  $  .#","# $@$  #","#      #","########"] },
+  { name:'再移動',       par:12, hard:true, map:["##########","#    #   #","# $$ * ..#","#    #   #","#@   #   #","##########"] },
+  { name:'共有マス',     par:13, hard:true, map:["#########","#      .#","#  # # *#","#@$    .#","# $# # *#","#       #","#########"] },
+  { name:'一本道',       par:22, hard:true, map:["#########","#   #   #","#   #*. #","#    *+ #","# $ #$  #","#   #   #","#########"],
+    flavor:['（棚橋）「もう半分。手が覚えてきたね」'] },
+  { name:'角の即死',     par:22, hard:true, map:["#########","#       #","# $#@#..#","# $ $ ..#","# $# #  #","#       #","#########"] },
+  { name:'複合・長工程', par:28, hard:true, map:["#########","#   #.. #","# $ #.. #","#   $@  #","# $$#   #","#   #   #","#########"] },
+  { name:'凍結注意',     par:27, hard:true, map:["#########","# $    .#","# $#@#..#","# $ $ ..#","# $# #  #","#       #","#########"] },
+  { name:'全部盛り',     par:34, hard:true, map:["#########","#   #...#","#   #..@#","#   $$$$#","# $ #   #","#   #   #","#########"] },
+  // ---- v08: 広間ステージ（21〜30面）。検証済みの2部屋を通路で連結した大型面。
+  //      画面が広がり、parは「各部屋の理論最短の合計」＝達成可能な参考値。
+  { name:'相部屋', par:19, hard:true, wide:true, map:["#################","#      .    ..  #","#  # # *## $$$$ #","#@$    .##  ..  #","# $# # *##      #","#       #########","#################"],
+    flavor:['（棚橋）「今日から"広間"担当だ。倉庫が――繋がったんだよ」','（棚橋）「部屋ごとに片付けるのが基本。欲張ると運び直しになる」'] },
+  { name:'左右分業', par:20, hard:true, wide:true, map:["################","#   #     . $  #","# $ # . ## $#$ #","# $ @ . ##  $ .#","#   #   ##.   .#","################"] },
+  { name:'ねじれ回廊', par:21, hard:true, wide:true, map:["################","#.  $  .       #","# ### # ## $.$ #","# #     ##.$#$.#","# # ###$## $.$ #","#.$ $  +##  .. #","################"] },
+  { name:'二重業務', par:22, hard:true, wide:true, map:["###############","#  #  .  .   .#","#  #  .##  $  #","#  $  .## $ $ #","# $@$  ##  .  #","#      ########","###############"] },
+  { name:'運び直し', par:22, hard:true, wide:true, map:["##################","#    #      .  $ #","# $$ * ..## $  . #","#    #   ##      #","#@   #   ## .  $ #","########### $  . #","##################"] },
+  { name:'長い一日', par:26, hard:true, wide:true, map:["################","#   #       .  #","#   #*. ##  $  #","#    *+ ##.$ $.#","# $ #$  ##  $  #","#   #   ##  .  #","################"],
+    flavor:['（棚橋）「広間も折り返しだ。……ここから先は、私も手伝わない」'] },
+  { name:'死角だらけ', par:31, hard:true, wide:true, map:["#################","#          . . .#","# $#@#..##      #","# $ $ ..## $$$  #","# $# #  ##      #","#       #########","#################"] },
+  { name:'二正面作戦', par:32, hard:true, wide:true, map:["################","#   #..   .   .#","# $ #.. ## $#$ #","#   $@  ##     #","# $$#   ########","#   #   ########","################"] },
+  { name:'凍える倉庫', par:37, hard:true, wide:true, map:["################","# $    .  . $  #","# $#@#..## $#$ #","# $ $ ..##  $ .#","# $# #  ##.   .#","#       ########","################"] },
+  { name:'くらくら決算日', par:56, hard:true, wide:true, map:["##################","#   #...         #","#   #..@## $# #..#","#   $$$$## $ $ ..#","# $ #   ## $# #  #","#   #   ##       #","##################"],
+    flavor:['（棚橋）「決算日だ。倉庫中の箱が、今日中に全部あるべき場所へ」','（棚橋）「きみなら、できる。"くらくら倉庫"最後の大仕事だ」'] },
+  // ---- v14: EX裏倉庫（27〜30面）。決算を終えた者だけが入れる最深部。
+  //      28・30面は単室の新作＝押しBFSソルバーで理論最短を機械検証済み（par53 / par63）。
+  //      27・29面は広間方式（検証済み2部屋の連結。par=各部屋の理論最短の合計＝達成可能な参考値。
+  //      連結先の部屋は入口位置からの解をソルバーで個別に機械検証済み）。
+  { name:'二大難所', par:50, hard:true, wide:true, map:["#################","#   #.. #   #   #","# $ #.. # .*#   #","#   $@  # .*    #","# $$#   #  $# $ #","#   #       #   #","#################"],
+    flavor:['（棚橋）「――決算は終わった。だが、倉庫の奥にもう一つ扉があってね」','（棚橋）「通称"裏倉庫"。ここからは、私も配置を知らないんだ」'] },
+  { name:'詰め込み順', par:53, hard:true, wide:true, map:["################","#   #      #...#","#   $ $ $  #...#","# @  $ $ $     #","#   #      #   #","#   #          #","################"],
+    flavor:['（棚橋）「奥の詰め所は6箱ぴったり。奥の列から、上の段から――順番がすべてだ」'] },
+  { name:'裏の全部盛り', par:61, hard:true, wide:true, map:["#################","#   #...# $    .#","#   #..@# $# #..#","#   $$$$# $ $ ..#","# $ #   # $# #  #","#   #           #","#################"],
+    flavor:['（棚橋）「あの"全部盛り"の裏に、凍る部屋が繋がってた。壁ぎわは一手で凍るよ」'] },
+  { name:'裏倉庫の主', par:63, hard:true, wide:true, map:["################","#     ##      .#","# $$$ ##  #  ..#","#  @     *   ..#","# $$  ##  #    #","#     ##########","################"],
+    flavor:['（棚橋）「通路の真ん中の箱――動かす前に、動かした後のことまで考えて」','（棚橋）「一時置きの妙、詰め込みの順。全部使って、"裏倉庫の主"になりな」'] },
+];
+function isDeadCorner(x,y){    // ゴールでない箱が壁の直角コーナーに入っている＝詰み警告
+  if(G.goals.has(x+','+y)) return false;
+  const L=G.walls.has((x-1)+','+y), R=G.walls.has((x+1)+','+y), U=G.walls.has(x+','+(y-1)), D=G.walls.has(x+','+(y+1));
+  return (L&&U)||(L&&D)||(R&&U)||(R&&D);
+}
+
+function loadLevel(i){
+  // v08: 広間ステージ（wide）は画面そのものを拡大する
+  const cw=LEVELS[i].wide?760:480, ch=LEVELS[i].wide?600:520;
+  if(C.width!==cw){ C.width=cw; C.height=ch; W=cw; H=ch; }
+  const map=LEVELS[i].map;
+  const rows=map.length, cols=Math.max.apply(null, map.map(s=>s.length));
+  const walls=new Set(), goals=new Set(), boxes=new Set(); let px=0,py=0;
+  for(let y=0;y<rows;y++){ const line=map[y]; for(let x=0;x<cols;x++){ const ch=line[x]||' ';
+    if(ch==='#') walls.add(x+','+y);
+    else if(ch==='.') goals.add(x+','+y);
+    else if(ch==='$') boxes.add(x+','+y);
+    else if(ch==='*'){ boxes.add(x+','+y); goals.add(x+','+y); }
+    else if(ch==='@'){ px=x; py=y; }
+    else if(ch==='+'){ px=x; py=y; goals.add(x+','+y); } } }
+  const ts=Math.min(Math.floor((W-40)/cols), Math.floor((H-140)/rows), 50);
+  const ox=Math.round((W-cols*ts)/2), oy=Math.round(72+((H-138)-rows*ts)/2);
+  G={ lvl:i, rows, cols, ts, ox, oy, walls, goals, boxes, px, py, moves:0, pushes:0, undo:[], allClear:false, pop:null };
+  state='play';
+  const lv=LEVELS[i];
+  SFX.setTier(lv.wide?2:(lv.hard?1:0));   // M2: 面タイプでBGMを切替
+  SFX.startBGM();                         // M2: クリア/ポーズで止めたBGMを面の開始で必ず鳴らし直す
+  if(lv.flavor && !shownFlavorLv.has(i)){ shownFlavorLv.add(i); flavorText=lv.flavor; flavorBorn=clock(); FX.burst(W/2,90,'#ffe27a',10); }
+  else flavorText=null;
+}
+function startGame(){
+  if(!seenIntro){ state='intro'; return; }
+  shownFlavorLv=new Set(); loadLevel(0); SFX.startBGM();
+}
+function confirmIntro(){
+  seenIntro=true; try{ localStorage.setItem('hakoloshi_intro','1'); }catch(e){}
+  shownFlavorLv=new Set(); loadLevel(0); SFX.startBGM();
+}
+function cellC(x,y){ return [G.ox+x*G.ts+G.ts/2, G.oy+y*G.ts+G.ts/2]; }
+function snapshot(){ G.undo.push({px:G.px,py:G.py,boxes:[...G.boxes],moves:G.moves,pushes:G.pushes});
+  if(G.undo.length>400) G.undo.shift(); }
+function undo(){ if(!G.undo.length) return; const s=G.undo.pop();
+  G.px=s.px; G.py=s.py; G.boxes=new Set(s.boxes); G.moves=s.moves; G.pushes=s.pushes; SFX.undo(); }
+// D2: 壁・箱にぶつかった瞬間の手応え＝進行方向へ小さくゆれ、接触点に鈍い土煙
+function bump(dx,dy){ FX.shake(3); const [cx,cy]=cellC(G.px+dx*0.5, G.py+dy*0.5); FX.puff(cx,cy,'#8a8f9e',3,1.4); }
+function move(dx,dy){
+  const nx=G.px+dx, ny=G.py+dy, nk=nx+','+ny;
+  if(G.walls.has(nk)){ SFX.blocked(); bump(dx,dy); return; }
+  if(G.boxes.has(nk)){
+    const bx=nx+dx, by=ny+dy, bk=bx+','+by;
+    if(G.walls.has(bk)||G.boxes.has(bk)){ SFX.blocked(); bump(dx,dy); return; }
+    snapshot();
+    G.boxes.delete(nk); G.boxes.add(bk); G.px=nx; G.py=ny; G.moves++; G.pushes++;
+    const [cx,cy]=cellC(bx,by);
+    if(G.goals.has(bk)){                                           // D2: 納めた瞬間＝金の衝撃波＋二色の火花＋ふわっと閃光＋箱がぽんと弾む
+      FX.burst(cx,cy,'#7CFC00',14); FX.burst(cx,cy,'#ffe27a',9);
+      FX.ring(cx,cy,'rgba(255,225,120,0.95)',G.ts*1.55,0.5,4);
+      FX.shake(6); FX.flash(0.12,'#ffe9a0');
+      G.pop={x:bx,y:by,t:clock()};
+      SFX.place([...G.goals].filter(g=>!G.boxes.has(g)).length);   // M4: 残り数で音程が上がる
+    } else {
+      SFX.push();                                                  // M4: 押しは足音と別の「こする」音
+      FX.puff(cx,cy+G.ts*0.28,'#b98d5a',5,1.15); FX.shake(1.5);    // D2: 床をこする土煙＋わずかなゆれ
+      if(isDeadCorner(bx,by)){ FX.ring(cx,cy,'rgba(255,70,70,0.8)',G.ts*1.3,0.45,3); setTimeout(()=>SFX.warn(),120); } // D2/M4: 詰みは赤い警告リング＋ブザー
+    }
+    checkWin();
+  } else { snapshot(); G.px=nx; G.py=ny; G.moves++; SFX.move(); }
+}
+function checkWin(){
+  for(const g of G.goals){ if(!G.boxes.has(g)) return; }
+  G.allClear = (G.lvl>=LEVELS.length-1);
+  state='over';
+  SFX.stopBGM();                                            // M2: ジングルを聴かせるためBGMを止める（次の面で再開）
+  if(G.allClear) SFX.allClear(); else SFX.clear();          // M3: 場面別の専用ジングル
+  if(G.pushes<=LEVELS[G.lvl].par) SFX.perfect();            // 理論最短達成のきらめきを重ねる
+  FX.shake(G.allClear?16:9); FX.flash(G.allClear?0.6:0.28, G.allClear?'#fff':'#c9ffb0');
+  // D2: 盤面中心から広がる衝撃波リング。クリアの「達成」を画面全体で伝える
+  const bcx=G.ox+G.cols*G.ts/2, bcy=G.oy+G.rows*G.ts/2, span=Math.max(G.cols,G.rows)*G.ts;
+  FX.ring(bcx,bcy,'rgba(124,252,0,0.95)', span*0.7, 0.55, 6);
+  FX.ring(bcx,bcy,'rgba(255,255,255,0.7)', span*0.45, 0.4, 3);
+  if(G.allClear){
+    FX.ring(bcx,bcy,'rgba(255,210,77,0.95)', Math.max(W,H)*0.62, 0.8, 7);
+    setTimeout(()=>FX.ring(bcx,bcy,'rgba(255,210,77,0.8)', Math.max(W,H)*0.7, 0.7, 5), 180);   // 追いリングで華やかに
+    setTimeout(()=>FX.ring(bcx,bcy,'rgba(126,200,255,0.8)', Math.max(W,H)*0.55, 0.7, 5), 360);
+    const cols=['#ffd24d','#7CFC00','#7ec8ff','#ff9d9d','#ffe27a'];
+    for(let i=0;i<8;i++) FX.burst(W/2+(Math.random()-0.5)*260, H/2+(Math.random()-0.5)*170, cols[i%cols.length], 12);
+    try{ localStorage.setItem('hakoloshi_cleared','1'); }catch(e){} }
+  const prev=Best.get(G.lvl);
+  if(prev===0 || G.moves<prev) Best.set(G.lvl, G.moves);
+}
+function update(dt){ /* ターン制：移動は onKey で即時処理 */ }
+
+// ---- 描画 ----
+// 井上瑞季(D1/D3 版画リニューアル): コンセプトアート「くらくら倉庫」に合わせ、
+//   盤面を〈木の床＋積み木箱の壁＋光る目標＋鉄具付き木箱〉の統一されたビジュアルに刷新。
+function drawFloor(px,py,ts){
+  ctx.fillStyle='#241c14'; ctx.fillRect(px,py,ts,ts);                       // 暖色の倉庫床板
+  const seam=((px*13+py*7)>>3)&1;                                           // セル依存で板をずらす（ちらつき無し）
+  ctx.strokeStyle='rgba(0,0,0,0.30)'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(px+0.5,py+ts*0.5); ctx.lineTo(px+ts-0.5,py+ts*0.5); ctx.stroke();  // 横目地
+  ctx.beginPath();
+  if(seam){ ctx.moveTo(px+ts*0.5,py+0.5); ctx.lineTo(px+ts*0.5,py+ts*0.5); }
+  else    { ctx.moveTo(px+ts*0.34,py+ts*0.5); ctx.lineTo(px+ts*0.34,py+ts-0.5);
+            ctx.moveTo(px+ts*0.68,py+ts*0.5); ctx.lineTo(px+ts*0.68,py+ts-0.5); }
+  ctx.stroke();
+  ctx.strokeStyle='rgba(255,220,170,0.05)'; ctx.strokeRect(px+0.5,py+0.5,ts-1,ts-1); }
+function drawWall(px,py,ts){                                                // 積み上げた木箱の壁
+  ctx.fillStyle='#4a3320'; ctx.fillRect(px,py,ts,ts);
+  ctx.fillStyle='rgba(255,225,180,0.10)'; ctx.fillRect(px+2,py+2,ts-4,2);   // 上ハイライト
+  ctx.fillStyle='rgba(0,0,0,0.30)'; ctx.fillRect(px+2,py+ts-4,ts-4,3);      // 下影
+  ctx.strokeStyle='rgba(0,0,0,0.45)'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(px,py+ts/2); ctx.lineTo(px+ts,py+ts/2); ctx.stroke();  // 板目地
+  ctx.strokeStyle='rgba(0,0,0,0.55)'; ctx.strokeRect(px+0.5,py+0.5,ts-1,ts-1);
+  ctx.fillStyle='#2b2b30'; const b=Math.max(2,ts*0.12|0);                   // 隅の鉄具
+  ctx.fillRect(px+2,py+2,b,b); ctx.fillRect(px+ts-2-b,py+2,b,b);
+  ctx.fillRect(px+2,py+ts-2-b,b,b); ctx.fillRect(px+ts-2-b,py+ts-2-b,b,b); }
+function drawGoal(px,py,ts){ const cx=px+ts/2,cy=py+ts/2;                   // 光る金の目標マス（タイトル画の光る床を再現）
+  const pulse=0.5+0.5*Math.sin(clock()/380);
+  const g=ctx.createRadialGradient(cx,cy,ts*0.05,cx,cy,ts*0.5);
+  g.addColorStop(0,'rgba(255,225,120,'+(0.45+0.35*pulse).toFixed(3)+')');
+  g.addColorStop(0.6,'rgba(255,190,60,0.18)'); g.addColorStop(1,'rgba(255,190,60,0)');
+  ctx.fillStyle=g; ctx.fillRect(px,py,ts,ts);
+  ctx.save(); ctx.translate(cx,cy);                                         // 中央の四芒星（きらめき）
+  ctx.fillStyle='rgba(255,238,160,'+(0.65+0.3*pulse).toFixed(3)+')';
+  ctx.beginPath();
+  for(let i=0;i<8;i++){ const a=i*Math.PI/4-1.5708, r=(i&1?ts*0.09:ts*0.24); ctx.lineTo(Math.cos(a)*r,Math.sin(a)*r); }
+  ctx.closePath(); ctx.fill(); ctx.restore();
+  ctx.strokeStyle='rgba(255,210,90,0.45)'; ctx.lineWidth=1; ctx.strokeRect(px+2.5,py+2.5,ts-5,ts-5); }
+function drawBox(px,py,ts,onGoal,warn){                                     // 鉄具付きの木箱（コンセプトアート準拠）
+  const m=Math.max(2,ts*0.08), x=px+m, y=py+m, w=ts-2*m, h=ts-2*m, cx=px+ts/2, cy=py+ts/2;
+  if(onGoal){                                                              // 達成: 背後に金の輝き
+    const gl=ctx.createRadialGradient(cx,cy,ts*0.12,cx,cy,ts*0.62);
+    gl.addColorStop(0,'rgba(255,225,130,0.55)'); gl.addColorStop(1,'rgba(255,210,90,0)');
+    ctx.fillStyle=gl; ctx.fillRect(px-ts*0.2,py-ts*0.2,ts*1.4,ts*1.4); }
+  const g=ctx.createLinearGradient(x,y,x,y+h);                             // 木の本体
+  if(onGoal){ g.addColorStop(0,'#ecc884'); g.addColorStop(1,'#c79246'); }
+  else      { g.addColorStop(0,'#9a6636'); g.addColorStop(1,'#6f4522'); }
+  rrect(x,y,w,h,Math.max(2,ts*0.06)); ctx.fillStyle=g; ctx.fill();
+  ctx.strokeStyle=onGoal?'#7a5216':'#3a2410'; ctx.lineWidth=Math.max(1.5,ts*0.05); ctx.stroke();
+  ctx.strokeStyle=onGoal?'rgba(120,80,20,0.5)':'rgba(40,24,12,0.5)'; ctx.lineWidth=Math.max(1,ts*0.03);  // 縦板＋帯板
+  ctx.beginPath();
+  ctx.moveTo(x+w*0.24,y); ctx.lineTo(x+w*0.24,y+h); ctx.moveTo(x+w*0.76,y); ctx.lineTo(x+w*0.76,y+h);
+  ctx.moveTo(x,y+h*0.33); ctx.lineTo(x+w,y+h*0.33); ctx.moveTo(x,y+h*0.66); ctx.lineTo(x+w,y+h*0.66);
+  ctx.stroke();
+  ctx.strokeStyle=onGoal?'rgba(255,245,210,0.5)':'rgba(230,190,140,0.30)'; ctx.lineWidth=1;  // 木目ハイライト
+  ctx.beginPath(); ctx.moveTo(x+w*0.28,y+h*0.16); ctx.lineTo(x+w*0.72,y+h*0.16);
+  ctx.moveTo(x+w*0.30,y+h*0.84); ctx.lineTo(x+w*0.70,y+h*0.84); ctx.stroke();
+  const ir=onGoal?'#b8823a':'#2c2c33', L=Math.max(3,ts*0.2|0), t=Math.max(2,ts*0.07|0);   // 隅の鉄アングル（L字）
+  ctx.fillStyle=ir;
+  ctx.fillRect(x,y,L,t);         ctx.fillRect(x,y,t,L);
+  ctx.fillRect(x+w-L,y,L,t);     ctx.fillRect(x+w-t,y,t,L);
+  ctx.fillRect(x,y+h-t,L,t);     ctx.fillRect(x,y+h-L,t,L);
+  ctx.fillRect(x+w-L,y+h-t,L,t); ctx.fillRect(x+w-t,y+h-L,t,L);
+  ctx.fillStyle=onGoal?'#5a3c14':'#111'; const br=Math.max(1,ts*0.028);                     // ボルト
+  [[x+t*0.9,y+t*0.9],[x+w-t*0.9,y+t*0.9],[x+t*0.9,y+h-t*0.9],[x+w-t*0.9,y+h-t*0.9]]
+    .forEach(p=>{ ctx.beginPath(); ctx.arc(p[0],p[1],br,0,6.2832); ctx.fill(); });
+  ctx.fillStyle=onGoal?'#a9781f':'#2c2c33'; const lr=Math.max(3,ts*0.14);                    // 中央の錠前
+  ctx.beginPath(); ctx.arc(cx,cy,lr,0,6.2832); ctx.fill();
+  ctx.fillStyle=onGoal?'#f0d48a':'#4a4a52'; ctx.beginPath(); ctx.arc(cx,cy,lr*0.52,0,6.2832); ctx.fill();
+  if(onGoal){ ctx.fillStyle='#3a2606'; ctx.font='bold '+(ts*0.24|0)+'px sans-serif'; ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillText('✓',cx,cy+ts*0.01); ctx.textBaseline='alphabetic'; }
+  else { ctx.fillStyle='#15151a'; ctx.fillRect(cx-Math.max(1,ts*0.015),cy-lr*0.1,Math.max(1.5,ts*0.03),lr*0.7); } // 鍵穴
+  ctx.lineWidth=1;
+  if(warn){ const a=0.5+0.5*Math.sin(clock()/180); ctx.strokeStyle='rgba(255,60,60,'+a.toFixed(3)+')'; ctx.lineWidth=3;
+    rrect(px+1,py+1,ts-2,ts-2,5); ctx.stroke(); ctx.lineWidth=1; } }
+function drawPlayer(px,py,ts){ const cx=px+ts/2,cy=py+ts/2,r=ts*0.32;
+  ctx.fillStyle='rgba(0,0,0,0.25)'; ctx.beginPath(); ctx.ellipse(cx,py+ts-4,r*0.85,r*0.3,0,0,6.2832); ctx.fill();
+  const g=ctx.createRadialGradient(cx-r*0.3,cy-r*0.35,r*0.2,cx,cy,r);
+  g.addColorStop(0,'#ffe0b0'); g.addColorStop(0.6,'#ff9f45'); g.addColorStop(1,'#d97a1e');
+  ctx.fillStyle=g; ctx.beginPath(); ctx.arc(cx,cy,r,0,6.2832); ctx.fill();
+  ctx.strokeStyle='rgba(0,0,0,0.3)'; ctx.lineWidth=1.5; ctx.stroke(); ctx.lineWidth=1;
+  ctx.fillStyle='#fff'; ctx.beginPath(); ctx.arc(cx-r*0.3,cy-r*0.1,r*0.2,0,6.2832); ctx.arc(cx+r*0.3,cy-r*0.1,r*0.2,0,6.2832); ctx.fill();
+  ctx.fillStyle='#222'; ctx.beginPath(); ctx.arc(cx-r*0.26,cy-r*0.06,r*0.09,0,6.2832); ctx.arc(cx+r*0.34,cy-r*0.06,r*0.09,0,6.2832); ctx.fill();
+  ctx.strokeStyle='#a8550f'; ctx.lineWidth=1.5; ctx.beginPath(); ctx.arc(cx,cy+r*0.32,r*0.28,0.15,Math.PI-0.15); ctx.stroke(); ctx.lineWidth=1; }
+
+function render(){
+  clearBG();
+  ctx.textAlign='left'; ctx.fillStyle='#ffe27a'; ctx.font='bold 26px "Segoe UI"'; ctx.fillText('はこおし', 24, 44);
+  if(state==='title'){ ctx.fillStyle='#7e8bbf'; ctx.font='12px "Segoe UI"'; ctx.fillText('箱を◎の上に全部のせよう', 120, 42); renderTitle(); return; }
+  if(state==='intro'){ renderIntro(); return; }
+  // 面名（高難度は難所タイプを強調表示）
+  const L=LEVELS[G.lvl];
+  ctx.fillStyle= L.hard?'#ff9d9d':'#7e8bbf'; ctx.font=(L.hard?'bold ':'')+'14px "Segoe UI"';
+  ctx.fillText('面'+(G.lvl+1)+'「'+L.name+'」'+(L.hard?' ⚠高難度':''), 120, 42);
+  // 盤面
+  FX.preDraw();
+  for(let y=0;y<G.rows;y++) for(let x=0;x<G.cols;x++){ const k=x+','+y, px=G.ox+x*G.ts, py=G.oy+y*G.ts;
+    if(G.walls.has(k)) drawWall(px,py,G.ts); else { drawFloor(px,py,G.ts); if(G.goals.has(k)) drawGoal(px,py,G.ts); } }
+  for(const b of G.boxes){ const p=b.split(',').map(Number); const onGoal=G.goals.has(b);
+    const bpx=G.ox+p[0]*G.ts, bpy=G.oy+p[1]*G.ts;
+    const pt=(G.pop && G.pop.x===p[0] && G.pop.y===p[1]) ? (clock()-G.pop.t)/1000 : -1;
+    if(pt>=0 && pt<0.28){                                          // D2: 納めた箱が一瞬ぽんと弾む（達成の手触り）
+      const s=1+Math.sin(pt/0.28*Math.PI)*0.16, cx=bpx+G.ts/2, cy=bpy+G.ts/2;
+      ctx.save(); ctx.translate(cx,cy); ctx.scale(s,s); ctx.translate(-cx,-cy);
+      drawBox(bpx,bpy,G.ts,onGoal,false); ctx.restore();
+    } else drawBox(bpx,bpy,G.ts,onGoal,!onGoal&&isDeadCorner(p[0],p[1])); }
+  drawPlayer(G.ox+G.px*G.ts, G.oy+G.py*G.ts, G.ts);
+  FX.postDraw();
+  drawFlavorBanner();
+  // HUD
+  const remaining=[...G.goals].filter(g=>!G.boxes.has(g)).length;
+  const best=Best.get(G.lvl);
+  ctx.textAlign='left'; ctx.fillStyle='#9fb0e8'; ctx.font='13px "Segoe UI"';
+  ctx.fillText('面 '+(G.lvl+1)+'/'+LEVELS.length+'  手数 '+G.moves+'  押 '+G.pushes+'（理論最短 '+L.par+'）  残り '+remaining+(best?'  最少 '+best:''), 24, H-20);
+  ctx.fillStyle=SFX.on?'#7CFC00':'#888'; ctx.textAlign='right'; ctx.font='12px "Segoe UI"'; ctx.fillText((SFX.on?'♪ON':'♪OFF')+' (M)', W-16, H-20);
+  if(state==='pause') overlay('PAUSE','#7ec8ff','Pキーで再開');
+  if(state==='over'){
+    overlay(G.allClear?'ALL CLEAR! 🎉':'LEVEL CLEAR!', G.allClear?'#ffd24d':'#7CFC00',
+      G.allClear
+        ? 'すべての棚が、迷いなく並んでいる。\n「――お疲れ様、もう一人前だね」（棚橋さんの声）\nきみは今日、正式に「倉庫番」を名乗ることができた。\n\nスペースで最初から'
+        : 'スペースで次の面へ');
+    ctx.fillStyle='#fff'; ctx.font='16px "Segoe UI"'; ctx.textAlign='center';
+    ctx.fillText('手数 '+G.moves+'　押し '+G.pushes+'／理論最短 '+L.par+(G.pushes<=L.par?'　✨最短達成！':''), W/2, H/2+10);
+  }
+}
+function drawFlavorBanner(){
+  if(!flavorText) return;
+  const t=(clock()-flavorBorn)/1000;
+  if(t>=3.6){ flavorText=null; return; }
+  const a=t<0.3?t/0.3:(t>3.0?Math.max(0,1-(t-3.0)/0.6):1);
+  ctx.save(); ctx.globalAlpha=a;
+  const lh=18, h=flavorText.length*lh+14, y0=50;
+  ctx.fillStyle='rgba(8,10,24,0.85)'; ctx.fillRect(12,y0,W-24,h);
+  ctx.strokeStyle='rgba(255,210,77,0.4)'; ctx.lineWidth=1; ctx.strokeRect(12.5,y0+0.5,W-25,h-1);
+  ctx.fillStyle='#ffe27a'; ctx.font='13px "Segoe UI"'; ctx.textAlign='center';
+  flavorText.forEach((ln,i)=>ctx.fillText(ln, W/2, y0+22+i*lh));
+  ctx.restore();
+}
+function renderTitle(){
+  ctx.textAlign='center';
+  ctx.fillStyle='#fff'; ctx.font='bold 40px "Segoe UI"'; ctx.fillText('はこおし', W/2, 140);
+  drawGoal(W/2-90,165,40); drawBox(W/2-20,165,40,false); drawPlayer(W/2+50,165,40);
+  const info=['箱をすべて目標（◎）の上に乗せればクリア','← ↑ → ↓ で押す。箱は「引けない」ので注意','Z または U でひとつ戻す ／ R でやり直し',
+    '全'+LEVELS.length+'面：1〜6は練習、7〜16は⚠高難度','17〜26は🏭広間、27〜30は🔥EX裏倉庫（超高難度）','高難度面には「難所タイプ」の名前がついている','各面の理論最短押し数つき。最短達成を目指せ！'];
+  ctx.font='14px "Segoe UI"'; ctx.fillStyle='#bcd'; info.forEach((t,i)=>ctx.fillText(t,W/2,245+i*25));
+  ctx.fillStyle='#6d7bb0'; ctx.font='12px "Segoe UI"';
+  ctx.fillText('通称「くらくら倉庫」。棚の配置が日によって変わる、と噂の職場。', W/2, 418);
+  const cleared=(function(){ try{ return localStorage.getItem('hakoloshi_cleared')==='1'; }catch(e){ return false; } })();
+  if(cleared){ ctx.fillStyle='#ffd24d'; ctx.font='bold 13px "Segoe UI"'; ctx.fillText('★ 全面クリアの称号あり', W/2, 438); }
+  const blink=(clock()/500|0)%2===0; ctx.fillStyle=blink?'#ffe27a':'#667'; ctx.font='bold 22px "Segoe UI"';
+  ctx.fillText('スペース / クリックでスタート', W/2, 470);
+}
+function renderIntro(){
+  ctx.textAlign='center';
+  ctx.fillStyle='#fff'; ctx.font='bold 24px "Segoe UI"'; ctx.fillText('はじめに', W/2, 118);
+  const lines=['――ここは、通称「くらくら倉庫」。','棚の配置が、日によって変わるという噂の職場。','新米のきみは、今日からここで箱を運ぶ。'];
+  ctx.font='15px "Segoe UI"'; ctx.fillStyle='#cde';
+  lines.forEach((t,i)=>ctx.fillText(t, W/2, 185+i*30));
+  drawGoal(W/2-60,300,40); drawBox(W/2,300,40,false); drawPlayer(W/2+60,300,40);
+  const blink=(clock()/500|0)%2===0; ctx.fillStyle=blink?'#ffe27a':'#667'; ctx.font='bold 20px "Segoe UI"';
+  ctx.fillText('スペース / クリックではじめる', W/2, 420);
+}
+
+// ---- 入力 ----
+function onKey(code){
+  if(code==='KeyM'){ SFX.toggle(); return; }
+  if(state==='intro'){ if(code==='Space'||code==='Enter'){ SFX.select(); confirmIntro(); } return; }
+  if(code==='KeyR'){ if(state==='play'||state==='pause'||state==='over'){ SFX.reset(); loadLevel(G?G.lvl:0); } return; }
+  if(state==='title'){ if(code==='Space'||code==='Enter'){ SFX.select(); startGame(); } return; }
+  if(state==='over'){ if(code==='Space'||code==='Enter'){ SFX.select(); if(G.lvl<LEVELS.length-1) loadLevel(G.lvl+1); else startGame(); } return; }
+  // M2/M4: ポーズ中は倉庫が静まりかえる（BGM停止）／再開で鳴らし直す
+  if(code==='KeyP'){ if(state==='play'){ state='pause'; SFX.stopBGM(); SFX.pause(); }
+    else if(state==='pause'){ state='play'; SFX.resume(); SFX.startBGM(); } return; }
+  if(state!=='play') return;
+  if(code==='KeyZ'||code==='KeyU'||code==='Backspace'){ undo(); return; }
+  if(code==='ArrowLeft')  move(-1,0);
+  else if(code==='ArrowRight') move(1,0);
+  else if(code==='ArrowUp')    move(0,-1);
+  else if(code==='ArrowDown')  move(0,1);
+}
+
+// ==== スマホ操作（v05）: スワイプ移動＋タッチパッド ====
+// スワイプ: canvas上で24px以上動かした方向に1歩（タップは決定=Space扱い）
+(function(){
+  let sx=0, sy=0, st=0;
+  C.addEventListener('touchstart', e=>{ SFX.ensure();
+    const t=e.changedTouches[0]; sx=t.clientX; sy=t.clientY; st=clock(); e.preventDefault(); }, {passive:false});
+  C.addEventListener('touchend', e=>{
+    const t=e.changedTouches[0]; const dx=t.clientX-sx, dy=t.clientY-sy;
+    const adx=Math.abs(dx), ady=Math.abs(dy);
+    if (Math.max(adx,ady) < 24){                       // タップ＝決定
+      if (state==='title'||state==='over'||state==='intro') onKey('Space');
+      return;
+    }
+    if (state!=='play') return;
+    if (adx>ady) move(dx>0?1:-1, 0); else move(0, dy>0?1:-1);
+    e.preventDefault();
+  }, {passive:false});
+})();
+// タッチパッドボタン
+(function(){
+  document.querySelectorAll('#pad [data-mv]').forEach(b=>{
+    b.addEventListener('pointerdown', e=>{ e.preventDefault(); SFX.ensure();
+      if (state!=='play') return;
+      const [dx,dy]=b.dataset.mv.split(',').map(Number); move(dx,dy); });
+  });
+  document.getElementById('padUndo').addEventListener('pointerdown', e=>{ e.preventDefault(); SFX.ensure();
+    if (state==='play') undo(); });
+  document.getElementById('padReset').addEventListener('pointerdown', e=>{ e.preventDefault(); SFX.ensure();
+    onKey('KeyR'); });
+  document.getElementById('padNext').addEventListener('pointerdown', e=>{ e.preventDefault(); SFX.ensure();
+    onKey('Space'); });
+})();
+
+state='title';
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
