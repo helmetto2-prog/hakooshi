@@ -90,7 +90,8 @@ const Input = (function(){
   document.addEventListener('keydown', e => { SFX.ensure(); if(BLOCK.includes(e.code)) e.preventDefault();
     if(!keys.has(e.code)) edge.add(e.code); keys.add(e.code); onKey(e.code); });
   document.addEventListener('keyup', e => keys.delete(e.code));
-  C.addEventListener('click', () => { SFX.ensure(); if(state==='title'||state==='over'||state==='intro') onKey('Space'); });
+  C.addEventListener('click', (e) => { SFX.ensure(); if(titleTap(e.clientX,e.clientY)) return;   // v17：あそびかたボタン
+    if(state==='title'||state==='over'||state==='intro') onKey('Space'); });
   return { held:c=>keys.has(c), pressed:c=>edge.has(c), clearEdges:()=>edge.clear() };
 })();
 
@@ -455,8 +456,8 @@ function drawPlayer(px,py,ts){ const cx=px+ts/2,cy=py+ts/2,r=ts*0.32;
 
 function render(){
   clearBG();
+  if(state==='title'){ renderTitle(); return; }   // v17：タイトル画面を作り直し（左上の小さな題名はタイトルでは出さない）
   ctx.textAlign='left'; ctx.fillStyle='#ffe27a'; ctx.font='bold 26px "Segoe UI"'; ctx.fillText('はこおし', 24, 44);
-  if(state==='title'){ ctx.fillStyle='#7e8bbf'; ctx.font='12px "Segoe UI"'; ctx.fillText('箱を◎の上に全部のせよう', 120, 42); renderTitle(); return; }
   if(state==='intro'){ renderIntro(); return; }
   // 面名（高難度は難所タイプを強調表示）
   const L=LEVELS[G.lvl];
@@ -506,19 +507,120 @@ function drawFlavorBanner(){
   flavorText.forEach((ln,i)=>ctx.fillText(ln, W/2, y0+22+i*lh));
   ctx.restore();
 }
+// ── v17：タイトル画面を作り直し（大きなロゴ・箱を押す実演・丸い帯のスタート・「あそびかた」の面）──
+const TITLE_FONT='"Yu Gothic UI","Hiragino Sans","Meiryo","Segoe UI",sans-serif';
+const TITLE_HELP_BTN={w:200,h:36,y:362};          // 「あそびかた」ボタン（横はまん中に置く）
+let titleHelp=false;                               // 「あそびかた」の面を開いているか
+let titleRec={at:-1e9,n:0,all:false};              // 記録の札（保存データの読み直しは1秒に1回だけ）
+function titleRecord(){
+  const now=clock(); if(now-titleRec.at<1000) return titleRec;
+  let n=0; for(let i=0;i<LEVELS.length;i++){ if(Best.get(i)>0) n++; }
+  let all=false; try{ all=localStorage.getItem('hakoloshi_cleared')==='1'; }catch(e){}
+  titleRec={at:now,n:n,all:all}; return titleRec;
+}
+// ロゴ：1文字ずつ飛びこんで、そのあと波うつ。maxW をこえる時は字を小さくする
+function titleLogo(text,cx,y,size,t,maxW){
+  ctx.save(); ctx.textAlign='center'; ctx.textBaseline='alphabetic'; ctx.lineJoin='round';
+  const chars=[...text]; let ws, total;
+  const fit=()=>{ ctx.font='900 '+size+'px '+TITLE_FONT; ws=chars.map(ch=>ctx.measureText(ch).width); total=ws.reduce((p,q)=>p+q,0); };
+  fit(); if(total>maxW){ size=Math.floor(size*maxW/total); fit(); }
+  let x=cx-total/2;
+  chars.forEach((ch,i)=>{
+    const e=Math.max(0,Math.min(1,(t-0.15-i*0.09)/0.45));
+    const back=1+2.70158*Math.pow(e-1,3)+1.70158*Math.pow(e-1,2);
+    const bob=Math.sin(t*2.2-i*0.6)*3*e;
+    ctx.save(); ctx.translate(x+ws[i]/2, y+bob-(1-e)*40); ctx.scale(back,back); ctx.globalAlpha=e;
+    ctx.shadowColor='rgba(255,170,60,0.9)'; ctx.shadowBlur=22;
+    ctx.strokeStyle='#2a1707'; ctx.lineWidth=12; ctx.strokeText(ch,0,0);
+    ctx.shadowBlur=0;
+    ctx.strokeStyle='#ffffff'; ctx.lineWidth=4.5; ctx.strokeText(ch,0,0);
+    const g=ctx.createLinearGradient(0,-size*0.9,0,size*0.12);
+    g.addColorStop(0,'#fff7d6'); g.addColorStop(0.45,'#ffc94d'); g.addColorStop(1,'#e2742a');
+    ctx.fillStyle=g; ctx.fillText(ch,0,0);
+    ctx.restore(); x+=ws[i]; });
+  ctx.restore();
+}
+// タイトルで押した場所（画面の座標→キャンバスの座標）。あそびかたを開く／閉じる時は true を返す
+function titleTap(clientX,clientY){
+  if(state!=='title') return false;
+  if(titleHelp){ titleHelp=false; SFX.select(); return true; }
+  const r=C.getBoundingClientRect(); if(!r.width||!r.height) return false;
+  const x=(clientX-r.left)*W/r.width, y=(clientY-r.top)*H/r.height, b=TITLE_HELP_BTN;
+  if(x>=W/2-b.w/2-8 && x<=W/2+b.w/2+8 && y>=b.y-8 && y<=b.y+b.h+8){ titleHelp=true; SFX.select(); return true; }
+  return false;
+}
 function renderTitle(){
-  ctx.textAlign='center';
-  ctx.fillStyle='#fff'; ctx.font='bold 40px "Segoe UI"'; ctx.fillText('はこおし', W/2, 140);
-  drawGoal(W/2-90,165,40); drawBox(W/2-20,165,40,false); drawPlayer(W/2+50,165,40);
+  const cx=W/2, t=clock()/1000;
+  // 下地：まん中を少し明るく（倉庫の灯り）
+  { const g=ctx.createRadialGradient(cx,140,30,cx,210,H*0.8);
+    g.addColorStop(0,'rgba(150,100,40,0.30)'); g.addColorStop(0.5,'rgba(20,20,50,0.20)'); g.addColorStop(1,'rgba(4,6,18,0.70)');
+    ctx.fillStyle=g; ctx.fillRect(0,0,W,H); }
+  // 英字の小見出し
+  ctx.save(); ctx.textAlign='center'; ctx.font='bold 12px "Segoe UI",sans-serif'; ctx.fillStyle='rgba(255,214,140,0.9)';
+  { const s='WAREHOUSE PUZZLE', step=12; [...s].forEach((ch,i)=>ctx.fillText(ch, cx-(s.length-1)*step/2+i*step, 46)); }
+  ctx.strokeStyle='rgba(255,214,140,0.45)'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(cx-190,42); ctx.lineTo(cx-110,42); ctx.moveTo(cx+110,42); ctx.lineTo(cx+190,42); ctx.stroke();
+  ctx.restore();
+  // ロゴ
+  titleLogo('はこおし', cx, 124, 84, t, W*0.84);
+  // ひとこと
+  ctx.textAlign='center'; ctx.font='13px '+TITLE_FONT; ctx.fillStyle='rgba(214,222,255,0.92)';
+  ctx.fillText('通称「くらくら倉庫」。棚の配置が日によって変わる、と噂の職場。', cx, 162);
+  // 実演：倉庫番が箱を◎まで押していく（本編と同じ絵）
+  { const ts=40, x0=Math.round(cx-ts*3.5), y0=182, cyc=t%4.4, st=cyc/0.42, k=Math.floor(st);
+    const p=1+Math.min(3, k+Math.min(1,(st-k)/0.45)), bx=Math.max(3,p+1), done=bx>=5;
+    for(let i=0;i<7;i++){ if(i===0||i===6) drawWall(x0+i*ts,y0,ts); else { drawFloor(x0+i*ts,y0,ts); if(i===5) drawGoal(x0+i*ts,y0,ts); } }
+    const bpx=x0+bx*ts, pt=cyc-0.42*2.45;                                     // 納まった瞬間にぽんと弾む
+    if(done && pt>=0 && pt<0.28){ const s=1+Math.sin(pt/0.28*Math.PI)*0.16, mx=bpx+ts/2, my=y0+ts/2;
+      ctx.save(); ctx.translate(mx,my); ctx.scale(s,s); ctx.translate(-mx,-my); drawBox(bpx,y0,ts,true,false); ctx.restore(); }
+    else drawBox(bpx,y0,ts,done,false);
+    drawPlayer(x0+p*ts, y0-(done?0:Math.abs(Math.sin(st*Math.PI))*2), ts);
+    ctx.textAlign='left'; ctx.lineWidth=1; }
+  // 記録の札
+  { const rec=titleRecord(), items=['全 '+LEVELS.length+' 面', 'クリア '+rec.n+' 面']; if(rec.all) items.push('★ 全面クリアの称号あり');
+    ctx.font='bold 12px '+TITLE_FONT;
+    const ws=items.map(s=>ctx.measureText(s).width+22), total=ws.reduce((p,q)=>p+q,0)+8*(items.length-1);
+    let x=cx-total/2; const y=242;
+    items.forEach((s,i)=>{ rrect(x,y,ws[i],24,12); ctx.fillStyle='rgba(10,14,40,0.70)'; ctx.fill();
+      ctx.strokeStyle='rgba(255,226,122,0.55)'; ctx.lineWidth=1; ctx.stroke();
+      ctx.fillStyle='#ffe27a'; ctx.textAlign='center'; ctx.fillText(s, x+ws[i]/2, y+16); x+=ws[i]+8; }); }
+  // スタートの合図（ふわっと明滅する丸い帯）
+  { const p=0.5+0.5*Math.sin(t*3.2), w=Math.min(330,W-40), h=46, x=cx-w/2, y=292;
+    ctx.save(); ctx.globalAlpha=0.74+0.26*p; ctx.shadowColor='rgba(255,190,80,0.9)'; ctx.shadowBlur=8+12*p;
+    rrect(x,y,w,h,23); ctx.fillStyle='rgba(70,40,12,0.90)'; ctx.fill(); ctx.shadowBlur=0;
+    ctx.strokeStyle='#ffd27a'; ctx.lineWidth=2; ctx.stroke();
+    ctx.fillStyle='#fff'; ctx.textAlign='center'; ctx.font='900 19px '+TITLE_FONT;
+    ctx.fillText('▶  タップ ／ Space でスタート', cx, y+30); ctx.restore(); }
+  // 「あそびかた」ボタン
+  { const b=TITLE_HELP_BTN, x=cx-b.w/2;
+    rrect(x,b.y,b.w,b.h,18); ctx.fillStyle='rgba(18,24,60,0.78)'; ctx.fill();
+    ctx.strokeStyle='rgba(150,170,240,0.6)'; ctx.lineWidth=1.5; ctx.stroke();
+    ctx.fillStyle='#cfd9ff'; ctx.textAlign='center'; ctx.font='bold 15px '+TITLE_FONT;
+    ctx.fillText('？ あそびかた（H）', cx, b.y+24); }
+  // 操作の要点（小さく3行）
+  ctx.textAlign='center'; ctx.font='13px '+TITLE_FONT; ctx.fillStyle='rgba(160,174,222,0.92)';
+  ctx.fillText('箱をすべて目標（◎）の上に乗せればクリア', cx, 432);
+  ctx.fillText('← ↑ → ↓ で押す（スマホ＝スワイプ）。箱は「引けない」ので注意', cx, 452);
+  ctx.fillText('Z・U もどす　　R やり直し　　P ポーズ　　M 音', cx, 472);
+  ctx.lineWidth=1;
+  if(titleHelp) renderTitleHelp();
+}
+// v17：「あそびかた」の面（もとのタイトルにあった説明をここへ移した。文はそのまま）
+function renderTitleHelp(){
+  const cx=W/2, x=14, y=22, w=W-28, h=H-44;
+  ctx.fillStyle='rgba(4,6,18,0.78)'; ctx.fillRect(0,0,W,H);
+  rrect(x,y,w,h,18); ctx.fillStyle='rgba(16,20,52,0.97)'; ctx.fill();
+  ctx.strokeStyle='rgba(255,210,122,0.7)'; ctx.lineWidth=2; ctx.stroke(); ctx.lineWidth=1;
+  ctx.textAlign='center'; ctx.fillStyle='#ffe27a'; ctx.font='900 26px '+TITLE_FONT; ctx.fillText('あそびかた', cx, y+46);
   const info=['箱をすべて目標（◎）の上に乗せればクリア','← ↑ → ↓ で押す。箱は「引けない」ので注意','Z または U でひとつ戻す ／ R でやり直し',
-    '全'+LEVELS.length+'面：1〜6は練習、7〜16は⚠高難度','17〜26は🏭広間、27〜30は🔥EX裏倉庫（超高難度）','高難度面には「難所タイプ」の名前がついている','各面の理論最短押し数つき。最短達成を目指せ！'];
-  ctx.font='14px "Segoe UI"'; ctx.fillStyle='#bcd'; info.forEach((t,i)=>ctx.fillText(t,W/2,245+i*25));
-  ctx.fillStyle='#6d7bb0'; ctx.font='12px "Segoe UI"';
-  ctx.fillText('通称「くらくら倉庫」。棚の配置が日によって変わる、と噂の職場。', W/2, 418);
-  const cleared=(function(){ try{ return localStorage.getItem('hakoloshi_cleared')==='1'; }catch(e){ return false; } })();
-  if(cleared){ ctx.fillStyle='#ffd24d'; ctx.font='bold 13px "Segoe UI"'; ctx.fillText('★ 全面クリアの称号あり', W/2, 438); }
-  const blink=(clock()/500|0)%2===0; ctx.fillStyle=blink?'#ffe27a':'#667'; ctx.font='bold 22px "Segoe UI"';
-  ctx.fillText('スペース / クリックでスタート', W/2, 470);
+    '全'+LEVELS.length+'面：1〜6は練習、7〜16は⚠高難度','17〜26は🏭広間、27〜30は🔥EX裏倉庫（超高難度）','高難度面には「難所タイプ」の名前がついている','各面の理論最短押し数つき。最短達成を目指せ！',
+    'クリアで Space 次へ ／ M 音 ／ P ポーズ','スマホ＝スワイプでも移動（下のボタンでも押せる）'];
+  ctx.font='16px '+TITLE_FONT; ctx.fillStyle='#dbe4ff';
+  info.forEach((s,i)=>ctx.fillText(s, cx, y+92+i*34));
+  drawGoal(cx-70,y+h-104,36); drawBox(cx-18,y+h-104,36,false,false); drawPlayer(cx+34,y+h-104,36);
+  ctx.lineWidth=1; ctx.textAlign='center';
+  ctx.fillStyle='rgba(160,174,222,0.95)'; ctx.font='bold 14px '+TITLE_FONT;
+  ctx.fillText('タップ ／ H ／ Space でとじる', cx, y+h-28);
 }
 function renderIntro(){
   ctx.textAlign='center';
@@ -536,7 +638,11 @@ function onKey(code){
   if(code==='KeyM'){ SFX.toggle(); return; }
   if(state==='intro'){ if(code==='Space'||code==='Enter'){ SFX.select(); confirmIntro(); } return; }
   if(code==='KeyR'){ if(state==='play'||state==='pause'||state==='over'){ SFX.reset(); loadLevel(G?G.lvl:0); } return; }
-  if(state==='title'){ if(code==='Space'||code==='Enter'){ SFX.select(); startGame(); } return; }
+  if(state==='title'){
+    // v17：タイトル画面を作り直し（H であそびかたを開閉。開いている間の Space / Enter / Esc は「とじる」）
+    if(code==='KeyH'){ titleHelp=!titleHelp; SFX.select(); return; }
+    if(titleHelp){ if(code==='Space'||code==='Enter'||code==='Escape'){ titleHelp=false; SFX.select(); } return; }
+    if(code==='Space'||code==='Enter'){ SFX.select(); startGame(); } return; }
   if(state==='over'){ if(code==='Space'||code==='Enter'){ SFX.select(); if(G.lvl<LEVELS.length-1) loadLevel(G.lvl+1); else startGame(); } return; }
   // M2/M4: ポーズ中は倉庫が静まりかえる（BGM停止）／再開で鳴らし直す
   if(code==='KeyP'){ if(state==='play'){ state='pause'; SFX.stopBGM(); SFX.pause(); }
@@ -559,6 +665,7 @@ function onKey(code){
     const t=e.changedTouches[0]; const dx=t.clientX-sx, dy=t.clientY-sy;
     const adx=Math.abs(dx), ady=Math.abs(dy);
     if (Math.max(adx,ady) < 24){                       // タップ＝決定
+      if (titleTap(t.clientX,t.clientY)) return;       // v17：あそびかたボタン
       if (state==='title'||state==='over'||state==='intro') onKey('Space');
       return;
     }
